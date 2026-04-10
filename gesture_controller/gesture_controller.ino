@@ -89,7 +89,7 @@ GestureState gState = STATE_IDLE;
 // ─────────────────────────────────────────────
 
 // BLE Keyboard object (Device name, Manufacturer, Battery %)
-NimBleKeyboard bleKeyboard("GestureController", "ESP32-Team", 100);
+BleKeyboard bleKeyboard("GestureController", "ESP32-Team", 100);
 
 // Timing
 unsigned long lastPollTime    = 0;
