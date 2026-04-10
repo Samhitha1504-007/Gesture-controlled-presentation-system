@@ -15,7 +15,7 @@
 //    (Search: "BleKeyboard")
 // ============================================================
 
-#include <BleKeyboard.h>
+#include <NimBleKeyboard.h>
 
 // ─────────────────────────────────────────────
 //  PIN DEFINITIONS
@@ -89,7 +89,7 @@ GestureState gState = STATE_IDLE;
 // ─────────────────────────────────────────────
 
 // BLE Keyboard object (Device name, Manufacturer, Battery %)
-BleKeyboard bleKeyboard("GestureController", "ESP32-Team", 100);
+NimBleKeyboard bleKeyboard("GestureController", "ESP32-Team", 100);
 
 // Timing
 unsigned long lastPollTime    = 0;
@@ -148,9 +148,9 @@ void setup() {
   pinMode(LED_IR,    OUTPUT);
 
   // PWM for status LED (LDR-controlled brightness)
-  ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RES_BITS);
-  ledcAttachPin(LED_STATUS, PWM_CHANNEL);
-  ledcWrite(PWM_CHANNEL, 128);   // Start at 50% brightness
+  // ESP32 Arduino Core 3.x API: ledcAttach replaces ledcSetup + ledcAttachPin
+  ledcAttach(LED_STATUS, PWM_FREQ, PWM_RES_BITS);
+  ledcWrite(LED_STATUS, 128);   // Start at 50% brightness
 
   // Initialize filter buffers to far-away distance
   for (int i = 0; i < FILTER_SAMPLES; i++) {
@@ -402,7 +402,7 @@ void updateStatusLED() {
   // Map: low LDR → low brightness; high LDR → high brightness
   int brightness = map(avg, 0, 4095, 15, 255);
   brightness = constrain(brightness, 15, 255);
-  ledcWrite(PWM_CHANNEL, brightness);
+  ledcWrite(LED_STATUS, brightness);  // Core 3.x: use pin, not channel
 }
 
 // ============================================================
