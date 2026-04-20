@@ -7,34 +7,34 @@
 //  SENSORS:
 //    - HC-SR04 Left  → Previous Slide (LEFT ARROW)
 //    - HC-SR04 Right → Next Slide     (RIGHT ARROW)
-//    - IR Break-beam → Play/Pause     (SPACEBAR)
-//    - LDR           → LED brightness control via PWM
+//    - IR Obstacle   → Play/Pause     (SPACEBAR)
+//    - LDR           → Analog ambient light readout (drives optional LED PWM)
 //
-//  LIBRARY REQUIRED:
-//    Install "ESP32 BLE Keyboard" by T-vK from Arduino Library Manager
-//    (Search: "BleKeyboard")
+//  LIBRARIES REQUIRED:
+//    - HijelHID_BLEKeyboard (Library Manager)
+//    - NimBLE-Arduino >= 2.3.8 (Library Manager)
+//  BOARD: ESP32 Dev Module, esp32 core 3.x
 // ============================================================
 
-#include <NimBleKeyboard.h>
+#include <HijelHID_BLEKeyboard.h>
 
 // ─────────────────────────────────────────────
 //  PIN DEFINITIONS
 // ─────────────────────────────────────────────
 
 // HC-SR04 Ultrasonic — LEFT (Previous Slide)
-#define TRIG_LEFT    25
-#define ECHO_LEFT    26
+#define TRIG_LEFT    32
+#define ECHO_LEFT    33
 
 // HC-SR04 Ultrasonic — RIGHT (Next Slide)
-#define TRIG_RIGHT   27
-#define ECHO_RIGHT   14
+#define TRIG_RIGHT   26
+#define ECHO_RIGHT   27
 
-// IR Break-beam Sensor (Play/Pause)
-// Connect OUT pin here; beam broken = LOW
-#define IR_SENSOR    34  // Must be INPUT-only GPIO (34-39 on ESP32)
+// IR Obstacle Sensor (Play/Pause) — active LOW when obstacle detected
+#define IR_SENSOR    13
 
-// LDR (Photoresistor) — Analog pin
-#define LDR_PIN      35  // Must be INPUT-only GPIO (34-39 on ESP32)
+// LDR (Photoresistor) — Analog pin (ADC2_CH6; OK with BLE, not WiFi)
+#define LDR_PIN      14
 
 // Status LEDs
 #define LED_LEFT     18  // Blinks when left gesture detected
@@ -52,19 +52,24 @@
 // ─────────────────────────────────────────────
 
 // Distance (cm) at which a hand triggers the sensor
-#define GESTURE_THRESHOLD_CM  20
+#define GESTURE_THRESHOLD_CM  35
 
 // After one sensor fires, wait this long for a "swipe-through" on the other
 #define SWIPE_WINDOW_MS       600
 
 // Minimum time a hand must be present before registering (debounce hold)
-#define HOLD_MIN_MS           150
+#define HOLD_MIN_MS           200
 
 // Ignore all inputs for this long after a gesture fires
-#define COOLDOWN_MS           900
+#define COOLDOWN_MS           1000
 
 // Median filter window size (must be odd for clean median)
-#define FILTER_SAMPLES        5
+#define FILTER_SAMPLES        7
+
+// Set to 1 if your IR module's OUT pin reads HIGH when an obstacle is present
+// (most modules are LOW-active; flip this if IR fires constantly even after
+// adjusting the sensitivity pot)
+#define IR_ACTIVE_HIGH        0
 
 // LDR smoothing window
 #define LDR_SAMPLES           8
@@ -89,7 +94,7 @@ GestureState gState = STATE_IDLE;
 // ─────────────────────────────────────────────
 
 // BLE Keyboard object (Device name, Manufacturer, Battery %)
-BleKeyboard bleKeyboard("GestureController", "ESP32-Team", 100);
+HijelHID_BLEKeyboard bleKeyboard("GestureController", "ESP32-Team", 100);
 
 // Timing
 unsigned long lastPollTime    = 0;
@@ -139,16 +144,15 @@ void setup() {
   pinMode(TRIG_RIGHT, OUTPUT);
   pinMode(ECHO_RIGHT, INPUT);
 
-  // IR Break-beam (active LOW when beam broken)
-  pinMode(IR_SENSOR, INPUT_PULLUP);
+  // IR obstacle sensor — module has its own pull-up, plain INPUT is correct
+  pinMode(IR_SENSOR, INPUT);
 
   // Status LEDs
   pinMode(LED_LEFT,  OUTPUT);
   pinMode(LED_RIGHT, OUTPUT);
   pinMode(LED_IR,    OUTPUT);
 
-  // PWM for status LED (LDR-controlled brightness)
-  // ESP32 Arduino Core 3.x API: ledcAttach replaces ledcSetup + ledcAttachPin
+  // PWM for status LED (LDR-controlled brightness) — ESP32 Core 3.x API
   ledcAttach(LED_STATUS, PWM_FREQ, PWM_RES_BITS);
   ledcWrite(LED_STATUS, 128);   // Start at 50% brightness
 
@@ -183,26 +187,29 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // Update status LED brightness from LDR (runs every loop)
-  updateStatusLED();
-
   // Poll sensors at the fixed interval only
   if (now - lastPollTime < SENSOR_POLL_INTERVAL) return;
   lastPollTime = now;
 
-  // Read all sensors
+  // Update status LED brightness from LDR (throttled with sensor poll)
+  updateStatusLED();
+
+  // Read all sensors — small gap between the two ultrasonics to avoid cross-talk
   float rawLeft  = measureDistance(TRIG_LEFT,  ECHO_LEFT);
+  delay(15);
   float rawRight = measureDistance(TRIG_RIGHT, ECHO_RIGHT);
-  bool  irBroken = (digitalRead(IR_SENSOR) == LOW);
+  bool  irBroken = IR_ACTIVE_HIGH ? (digitalRead(IR_SENSOR) == HIGH)
+                                  : (digitalRead(IR_SENSOR) == LOW);
 
   // Apply median filter for noise rejection
   float distLeft  = medianFilter(leftBuf,  leftBufIdx,  rawLeft);
   float distRight = medianFilter(rightBuf, rightBufIdx, rawRight);
 
   // Debug output to Serial Monitor
-  Serial.printf("[L: %5.1fcm | R: %5.1fcm | IR: %s | State: %d | BLE: %s]\n",
+  Serial.printf("[L: %5.1fcm | R: %5.1fcm | IR: %s | LDR: %4d | State: %d | BLE: %s]\n",
     distLeft, distRight,
     irBroken ? "BREAK" : "  OK ",
+    ldrSmoothed(),
     (int)gState,
     bleKeyboard.isConnected() ? "Connected" : "Waiting...");
 
@@ -223,10 +230,13 @@ void runStateMachine(float distLeft, float distRight, bool irBroken) {
     case STATE_IDLE:
 
       // IR gesture has priority (immediate — no swipe window needed)
-      if (irBroken) {
+      // Set IR_ENABLE to 0 to temporarily disable the IR trigger if your
+      // sensor fires constantly while you tune the pot.
+      #define IR_ENABLE 1
+      if (IR_ENABLE && irBroken) {
         Serial.println(">> IR BEAM BROKEN → SPACEBAR (Play/Pause)");
-        sendKey(' ', "SPACE");
-        blinkLED(LED_IR, 250);
+        sendKey(KEY_SPACE, "SPACE");
+        blinkLED(LED_IR, 30);
         cooldownStart = now;
         gState = STATE_COOLDOWN;
         return;
@@ -258,9 +268,9 @@ void runStateMachine(float distLeft, float distRight, bool irBroken) {
         if (distRight < GESTURE_THRESHOLD_CM &&
             (now - leftTriggerTime) < SWIPE_WINDOW_MS) {
           Serial.println(">> SWIPE RIGHT (L→R) → NEXT SLIDE (→)");
-          sendKey(KEY_RIGHT_ARROW, "RIGHT ARROW");
-          blinkLED(LED_RIGHT, 300);
-          blinkLED(LED_LEFT,  150);
+          sendKey(KEY_RIGHT, "RIGHT ARROW");
+          blinkLED(LED_RIGHT, 30);
+          blinkLED(LED_LEFT,  30);
           gState = STATE_COOLDOWN;
           cooldownStart = now;
           leftActive = false;
@@ -269,7 +279,7 @@ void runStateMachine(float distLeft, float distRight, bool irBroken) {
         else if (distLeft >= GESTURE_THRESHOLD_CM &&
                  (now - leftTriggerTime) >= HOLD_MIN_MS) {
           Serial.println(">> LEFT TAP → PREVIOUS SLIDE (←)");
-          sendKey(KEY_LEFT_ARROW, "LEFT ARROW");
+          sendKey(KEY_LEFT, "LEFT ARROW");
           blinkLED(LED_LEFT, 300);
           gState = STATE_COOLDOWN;
           cooldownStart = now;
@@ -288,9 +298,9 @@ void runStateMachine(float distLeft, float distRight, bool irBroken) {
         if (distLeft < GESTURE_THRESHOLD_CM &&
             (now - rightTriggerTime) < SWIPE_WINDOW_MS) {
           Serial.println(">> SWIPE LEFT (R→L) → PREVIOUS SLIDE (←)");
-          sendKey(KEY_LEFT_ARROW, "LEFT ARROW");
-          blinkLED(LED_LEFT,  300);
-          blinkLED(LED_RIGHT, 150);
+          sendKey(KEY_LEFT, "LEFT ARROW");
+          blinkLED(LED_LEFT,  30);
+          blinkLED(LED_RIGHT, 30);
           gState = STATE_COOLDOWN;
           cooldownStart = now;
           rightActive = false;
@@ -299,7 +309,7 @@ void runStateMachine(float distLeft, float distRight, bool irBroken) {
         else if (distRight >= GESTURE_THRESHOLD_CM &&
                  (now - rightTriggerTime) >= HOLD_MIN_MS) {
           Serial.println(">> RIGHT TAP → NEXT SLIDE (→)");
-          sendKey(KEY_RIGHT_ARROW, "RIGHT ARROW");
+          sendKey(KEY_RIGHT, "RIGHT ARROW");
           blinkLED(LED_RIGHT, 300);
           gState = STATE_COOLDOWN;
           cooldownStart = now;
@@ -402,7 +412,7 @@ void updateStatusLED() {
   // Map: low LDR → low brightness; high LDR → high brightness
   int brightness = map(avg, 0, 4095, 15, 255);
   brightness = constrain(brightness, 15, 255);
-  ledcWrite(LED_STATUS, brightness);  // Core 3.x: use pin, not channel
+  ledcWrite(LED_STATUS, brightness);  // Core 3.x: write to pin
 }
 
 // ============================================================
@@ -421,7 +431,7 @@ void blinkLED(int pin, int durationMs) {
 
 void sendKey(uint8_t key, const char* label) {
   if (bleKeyboard.isConnected()) {
-    bleKeyboard.write(key);
+    bleKeyboard.tap(key);
     Serial.printf("   [BLE] Sent key: %s\n", label);
   } else {
     Serial.println("   [BLE] NOT CONNECTED — key not sent!");
